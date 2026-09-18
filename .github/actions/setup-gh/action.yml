@@ -67,6 +67,7 @@ runs:
         echo "[INFO] GH_HOST=$GH_HOST"
 
         unset GH_TOKEN
+        unset GITHUB_TOKEN
 
         echo "$GH_PAT" | gh auth login \
           --with-token \
