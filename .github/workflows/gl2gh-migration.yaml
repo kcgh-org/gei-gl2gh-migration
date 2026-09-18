@@ -681,6 +681,7 @@ jobs:
           
           # ✅ Authenticate to GitHub host
           unset GH_TOKEN
+          unset GITHUB_TOKEN
           export TARGET_GITHUB_API_URL="${TARGET_GITHUB_API_URL:-}"
           if [[ -n "${TARGET_GITHUB_API_URL:-}" ]]; then
               GH_HOST="$(echo "$TARGET_GITHUB_API_URL" | sed -E 's#https://api\.##')"
