@@ -5,14 +5,14 @@ on:
     inputs:
       target_org:
         description: "Target GitHub org"
-        default: "archive"
+        default: "kcghorgz"
 
 jobs:
   report:
-    runs-on: [self-hosted]               # same runner label as migration pipeline
+    runs-on: [ubuntu-latest]               # same runner label as migration pipeline
     environment: gl2gh-migration-secrets
     env:
-      GH_HOST: sbi-n-systems.ghe.com
+      GH_HOST: github.com
       GH_TOKEN: ${{ secrets.GH_PAT }}
       GH_ENTERPRISE_TOKEN: ${{ secrets.GH_PAT }}
       ORG: ${{ inputs.target_org }}
