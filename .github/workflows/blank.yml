@@ -5,7 +5,7 @@ on:
     inputs:
       pipeline_repo:
         description: "Repo that runs the migration pipeline"
-        default: "archive/gl2gh-migration-pipeline"
+        default: "kcgh-org/gei-gl2gh-migration"
       pipeline_workflow:
         description: "Migration workflow name"
         default: "GitLab to GitHub Migration Pipeline"
@@ -16,21 +16,21 @@ on:
         default: all
       since_date:
         description: "Only runs created on/after (YYYY-MM-DD)"
-        default: "2026-10-30"
+        default: "2026-10-10"
       target_org:
         description: "Target GitHub org"
-        default: "archive"
+        default: "kcghorgz"
       log_issue_title:
         description: "Text in the title of the migration log issue"
         default: "migration log"
 
 jobs:
   audit:
-    runs-on: [self-hosted]               # same runner label as the migration pipeline
+    runs-on: [ubuntu-latest]               # same runner label as the migration pipeline
     environment: gl2gh-migration-secrets
     timeout-minutes: 120
     env:
-      GH_HOST: sbi-n-systems.ghe.com
+      GH_HOST: github.com
       GH_TOKEN: ${{ secrets.GH_PAT }}
       GH_ENTERPRISE_TOKEN: ${{ secrets.GH_PAT }}
       PIPE_REPO: ${{ inputs.pipeline_repo }}
