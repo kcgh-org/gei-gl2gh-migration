@@ -4,59 +4,533 @@ on:
   workflow_dispatch:
     inputs:
       target_org:
-        description: "Target GitHub org"
+        description: "Target GitHub organization"
+        required: true
         default: "kcghorgz"
+
+permissions:
+  contents: read
 
 jobs:
   report:
-    runs-on: [ubuntu-latest]               # same runner label as migration pipeline
+    runs-on: [ubuntu-latest]
     environment: gl2gh-migration-secrets
+
     env:
       GH_HOST: github.com
       GH_TOKEN: ${{ secrets.GH_PAT }}
       GH_ENTERPRISE_TOKEN: ${{ secrets.GH_PAT }}
       ORG: ${{ inputs.target_org }}
-      OUT: report
+      REPORT_DIR: ${{ github.workspace }}/migration-log-report
 
     steps:
-      - name: 1 & 2. Repo count and list
-        run: |
-          [ -n "$GH_TOKEN" ] || { echo "::error::GH_PAT missing"; exit 1; }
-          rm -rf $OUT; mkdir -p $OUT/logs
-          gh api "orgs/$ORG/repos?per_page=100&type=all" --paginate --jq '.[].name' | sort > $OUT/repo-list.txt
-          echo "Total repos in $ORG: $(wc -l < $OUT/repo-list.txt)" | tee $OUT/summary.txt
 
-      - name: 3. Migration Log comments per repo
+      - name: Validate configuration
+        shell: bash
         run: |
-          echo "repo,log_issue,warnings,errors" > $OUT/warnings-per-repo.csv
-          while read -r r; do
-            n=$(gh api "repos/$ORG/$r/issues?state=all&per_page=100" \
-                --jq '[.[] | select(.title=="Migration Log")][0].number // empty' 2>/dev/null)
-            if [ -z "$n" ]; then echo "$r,not-found,," >> $OUT/warnings-per-repo.csv; continue; fi
-            gh api "repos/$ORG/$r/issues/$n/comments?per_page=100" --paginate --jq '.[].body' > $OUT/logs/$r.log
-            grep -iE 'warn'        $OUT/logs/$r.log | sed "s|^|$r: |" >> $OUT/all-warnings.txt || true
-            grep -iE 'error|fail'  $OUT/logs/$r.log | sed "s|^|$r: |" >> $OUT/all-errors.txt   || true
-            echo "$r,#$n,$(grep -ciE 'warn' $OUT/logs/$r.log),$(grep -ciE 'error|fail' $OUT/logs/$r.log)" >> $OUT/warnings-per-repo.csv
-          done < $OUT/repo-list.txt
+          set -euo pipefail
 
-      - name: 4. Common warnings
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::GH_PAT secret is missing."
+            exit 1
+          fi
+
+          if [[ -z "${ORG:-}" ]]; then
+            echo "::error::Target GitHub organization is missing."
+            exit 1
+          fi
+
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::error::GitHub CLI is not installed on the runner."
+            exit 1
+          fi
+
+          echo "Validating GitHub authentication..."
+
+          if ! gh auth status --hostname "$GH_HOST" >/dev/null 2>&1; then
+            echo "::error::GitHub authentication failed."
+            exit 1
+          fi
+
+          echo "Validating access to organization: $ORG"
+
+          if ! gh api "orgs/$ORG" >/dev/null 2>&1; then
+            echo "::error::Unable to access GitHub organization: $ORG"
+            exit 1
+          fi
+
+          echo "Validation completed successfully."
+
+      - name: Generate migration log report
+        shell: bash
         run: |
-          touch $OUT/all-warnings.txt $OUT/all-errors.txt
-          norm='s/^[^:]*: //; s/^\[?[0-9T:.\/ -]+Z?\]? *//; s#https?://[^ )]+#<url>#g; s/'"'"'[^'"'"']*'"'"'/<x>/g; s/"[^"]*"/<x>/g; s/[0-9]+/<n>/g'
-          sed -E "$norm" $OUT/all-warnings.txt | sort | uniq -c | sort -rn > $OUT/common-warnings.txt
-          sed -E "$norm" $OUT/all-errors.txt   | sort | uniq -c | sort -rn > $OUT/common-errors.txt
+          set -euo pipefail
+
+          TEMP_DIR="${RUNNER_TEMP}/migration-log-report-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          rm -rf "$REPORT_DIR" "$TEMP_DIR"
+
+          mkdir -p "$REPORT_DIR/logs"
+          mkdir -p "$TEMP_DIR"
+
+          REPO_LIST="$REPORT_DIR/repo-list.txt"
+          ISSUE_SEARCH_RESULTS="$TEMP_DIR/migration-log-issues.jsonl"
+          ISSUE_MAP="$TEMP_DIR/migration-log-issue-map.tsv"
+          RESULT_ROWS="$TEMP_DIR/result-rows.csv"
+
+          WARNINGS_CSV="$REPORT_DIR/warnings-per-repo.csv"
+          ALL_WARNINGS="$REPORT_DIR/all-warnings.txt"
+          ALL_ERRORS="$REPORT_DIR/all-errors.txt"
+          COMMON_WARNINGS="$REPORT_DIR/common-warnings.txt"
+          COMMON_ERRORS="$REPORT_DIR/common-errors.txt"
+          SUMMARY="$REPORT_DIR/summary.txt"
+
+          touch "$ALL_WARNINGS"
+          touch "$ALL_ERRORS"
+          touch "$ISSUE_SEARCH_RESULTS"
+          touch "$ISSUE_MAP"
+          touch "$RESULT_ROWS"
+
+          echo "repo,log_issue,warnings,errors" > "$WARNINGS_CSV"
+
+          # ------------------------------------------------------------
+          # API request with controlled retry
+          # ------------------------------------------------------------
+
+          api_get() {
+            local endpoint="$1"
+            local output_file="$2"
+            local attempt=1
+            local max_attempts=5
+            local wait_seconds=10
+
+            while (( attempt <= max_attempts )); do
+
+              if gh api "$endpoint" --paginate > "$output_file"; then
+                return 0
+              fi
+
+              if (( attempt == max_attempts )); then
+                echo "::warning::API request failed after $max_attempts attempts: $endpoint"
+                return 1
+              fi
+
+              echo "API request failed. Retrying in ${wait_seconds} seconds..."
+
+              sleep "$wait_seconds"
+
+              attempt=$((attempt + 1))
+              wait_seconds=$((wait_seconds * 2))
+            done
+          }
+
+          # ------------------------------------------------------------
+          # Rate-limit protection
+          # ------------------------------------------------------------
+
+          check_rate_limit() {
+            local remaining
+            local reset_epoch
+            local current_epoch
+            local wait_seconds
+
+            remaining="$(
+              gh api rate_limit \
+                --jq '.resources.core.remaining' \
+                2>/dev/null || echo 5000
+            )"
+
+            if [[ ! "$remaining" =~ ^[0-9]+$ ]]; then
+              return 0
+            fi
+
+            if (( remaining >= 100 )); then
+              return 0
+            fi
+
+            reset_epoch="$(
+              gh api rate_limit \
+                --jq '.resources.core.reset' \
+                2>/dev/null || echo 0
+            )"
+
+            current_epoch="$(date +%s)"
+
+            if [[ "$reset_epoch" =~ ^[0-9]+$ ]] &&
+               (( reset_epoch > current_epoch )); then
+
+              wait_seconds=$((reset_epoch - current_epoch + 10))
+
+              echo "GitHub API rate limit is low."
+              echo "Remaining requests: $remaining"
+              echo "Waiting ${wait_seconds} seconds for reset..."
+
+              sleep "$wait_seconds"
+            fi
+          }
+
+          # ------------------------------------------------------------
+          # 1. Get repository list
+          # ------------------------------------------------------------
+
+          echo "Collecting repository list for organization: $ORG"
+
+          gh api \
+            "orgs/$ORG/repos?per_page=100&type=all" \
+            --paginate \
+            --jq '.[].name' |
+            LC_ALL=C sort -u > "$REPO_LIST"
+
+          TOTAL_REPOS="$(wc -l < "$REPO_LIST" | tr -d ' ')"
+
+          if (( TOTAL_REPOS == 0 )); then
+            echo "::error::No repositories were found in organization: $ORG"
+            exit 1
+          fi
+
+          echo "Total repositories found: $TOTAL_REPOS"
+
+          # ------------------------------------------------------------
+          # 2. Find Migration Log issues at organization level
+          #
+          # This avoids listing issues separately for all 863 repos.
+          # ------------------------------------------------------------
+
+          echo "Searching organization for Migration Log issues..."
+
+          gh api \
+            --method GET \
+            search/issues \
+            -f q="org:$ORG is:issue in:title \"Migration Log\"" \
+            -f per_page=100 \
+            --paginate \
+            --jq '.items[] |
+              select(.title == "Migration Log") |
+              {
+                repository_url: .repository_url,
+                issue_number: .number,
+                comments_url: .comments_url
+              }' > "$ISSUE_SEARCH_RESULTS"
+
+          # ------------------------------------------------------------
+          # Build local repo -> issue mapping
+          # ------------------------------------------------------------
+
+          if [[ -s "$ISSUE_SEARCH_RESULTS" ]]; then
+
+            jq -r '
+              [
+                (.repository_url | split("/") | last),
+                (.issue_number | tostring),
+                .comments_url
+              ] |
+              @tsv
+            ' "$ISSUE_SEARCH_RESULTS" |
+              LC_ALL=C sort -t $'\t' -k1,1 -k2,2n |
+              awk -F $'\t' '!seen[$1]++' > "$ISSUE_MAP"
+
+          fi
+
+          MIGRATION_LOG_COUNT="$(wc -l < "$ISSUE_MAP" | tr -d ' ')"
+
+          echo "Migration Log issues found: $MIGRATION_LOG_COUNT"
+
+          # ------------------------------------------------------------
+          # 3. Process repositories
+          # ------------------------------------------------------------
+
+          PROCESSED=0
+
+          while IFS= read -r repo; do
+
+            PROCESSED=$((PROCESSED + 1))
+
+            issue_entry="$(
+              awk -F $'\t' -v repo="$repo" '
+                $1 == repo {
+                  print $2 "\t" $3
+                  exit
+                }
+              ' "$ISSUE_MAP"
+            )"
+
+            # ----------------------------------------------------------
+            # Migration Log DOES NOT exist
+            # ----------------------------------------------------------
+
+            if [[ -z "$issue_entry" ]]; then
+
+              printf '%s,not-found,,\n' \
+                "$repo" >> "$RESULT_ROWS"
+
+              printf '[%d/%d] %s: Migration Log not found\n' \
+                "$PROCESSED" \
+                "$TOTAL_REPOS" \
+                "$repo"
+
+              continue
+            fi
+
+            # ----------------------------------------------------------
+            # Migration Log exists
+            # ----------------------------------------------------------
+
+            IFS=$'\t' read -r issue_number comments_url <<< "$issue_entry"
+
+            repo_log="$REPORT_DIR/logs/$repo.log"
+            comments_json="$TEMP_DIR/$repo-comments.json"
+
+            check_rate_limit
+
+            if ! api_get \
+              "$comments_url?per_page=100" \
+              "$comments_json"; then
+
+              printf '%s,#%s,comment-fetch-failed,comment-fetch-failed\n' \
+                "$repo" \
+                "$issue_number" >> "$RESULT_ROWS"
+
+              printf '[%d/%d] %s: Failed to retrieve Migration Log comments\n' \
+                "$PROCESSED" \
+                "$TOTAL_REPOS" \
+                "$repo"
+
+              rm -f "$comments_json"
+
+              continue
+            fi
+
+            # Convert API response to plain Migration Log text.
+            jq -r '.[].body // empty' \
+              "$comments_json" > "$repo_log"
+
+            warning_count="$(
+              grep -ciE 'warn' "$repo_log" || true
+            )"
+
+            error_count="$(
+              grep -ciE 'error|fail' "$repo_log" || true
+            )"
+
+            grep -iE 'warn' "$repo_log" |
+              sed "s|^|$repo: |" >> "$ALL_WARNINGS" || true
+
+            grep -iE 'error|fail' "$repo_log" |
+              sed "s|^|$repo: |" >> "$ALL_ERRORS" || true
+
+            printf '%s,#%s,%s,%s\n' \
+              "$repo" \
+              "$issue_number" \
+              "$warning_count" \
+              "$error_count" >> "$RESULT_ROWS"
+
+            printf '[%d/%d] %s: Migration Log #%s, warnings=%s, errors=%s\n' \
+              "$PROCESSED" \
+              "$TOTAL_REPOS" \
+              "$repo" \
+              "$issue_number" \
+              "$warning_count" \
+              "$error_count"
+
+            # API JSON is no longer required.
+            # Delete immediately to keep runner disk usage low.
+            rm -f "$comments_json"
+
+          done < "$REPO_LIST"
+
+          # ------------------------------------------------------------
+          # 4. Build final per-repository CSV
+          # ------------------------------------------------------------
+
+          cat "$RESULT_ROWS" >> "$WARNINGS_CSV"
+
+          # ------------------------------------------------------------
+          # 5. Normalize common warnings/errors
+          # ------------------------------------------------------------
+
+          NORMALIZATION_EXPRESSION='
+            s/^[^:]*: //;
+            s/^\[?[0-9T:.\/ -]+Z?\]? *//;
+            s#https?://[^ )]+#<url>#g;
+            s/'"'"'[^'"'"']*'"'"'/<x>/g;
+            s/"[^"]*"/<x>/g;
+            s/[0-9]+/<n>/g
+          '
+
+          if [[ -s "$ALL_WARNINGS" ]]; then
+
+            sed -E "$NORMALIZATION_EXPRESSION" "$ALL_WARNINGS" |
+              sed '/^[[:space:]]*$/d' |
+              LC_ALL=C sort |
+              uniq -c |
+              sort -rn > "$COMMON_WARNINGS"
+
+          else
+
+            : > "$COMMON_WARNINGS"
+
+          fi
+
+          if [[ -s "$ALL_ERRORS" ]]; then
+
+            sed -E "$NORMALIZATION_EXPRESSION" "$ALL_ERRORS" |
+              sed '/^[[:space:]]*$/d' |
+              LC_ALL=C sort |
+              uniq -c |
+              sort -rn > "$COMMON_ERRORS"
+
+          else
+
+            : > "$COMMON_ERRORS"
+
+          fi
+
+          # ------------------------------------------------------------
+          # 6. Calculate summary
+          # ------------------------------------------------------------
+
+          REPOS_WITH_LOG="$(
+            awk -F, '
+              NR > 1 && $2 != "not-found" {
+                count++
+              }
+              END {
+                print count + 0
+              }
+            ' "$WARNINGS_CSV"
+          )"
+
+          REPOS_WITHOUT_LOG="$(
+            awk -F, '
+              NR > 1 && $2 == "not-found" {
+                count++
+              }
+              END {
+                print count + 0
+              }
+            ' "$WARNINGS_CSV"
+          )"
+
+          REPOS_WITH_WARNINGS="$(
+            awk -F, '
+              NR > 1 &&
+              $3 ~ /^[0-9]+$/ &&
+              $3 > 0 {
+                count++
+              }
+              END {
+                print count + 0
+              }
+            ' "$WARNINGS_CSV"
+          )"
+
+          REPOS_WITH_ERRORS="$(
+            awk -F, '
+              NR > 1 &&
+              $4 ~ /^[0-9]+$/ &&
+              $4 > 0 {
+                count++
+              }
+              END {
+                print count + 0
+              }
+            ' "$WARNINGS_CSV"
+          )"
+
+          COMMENT_FETCH_FAILURES="$(
+            awk -F, '
+              NR > 1 &&
+              $3 == "comment-fetch-failed" {
+                count++
+              }
+              END {
+                print count + 0
+              }
+            ' "$WARNINGS_CSV"
+          )"
+
+          # ------------------------------------------------------------
+          # 7. Final summary
+          # ------------------------------------------------------------
+
           {
-            echo "Repos with Migration Log : $(grep -vc 'not-found' $OUT/warnings-per-repo.csv | awk '{print $1-1}')"
-            echo "Repos without log issue  : $(grep -c 'not-found' $OUT/warnings-per-repo.csv)"
-            echo "Repos with warnings      : $(awk -F, 'NR>1 && $3>0' $OUT/warnings-per-repo.csv | wc -l)"
-            echo "Repos with errors        : $(awk -F, 'NR>1 && $4>0' $OUT/warnings-per-repo.csv | wc -l)"
-            echo; echo "Top warnings (count  message):"; head -20 $OUT/common-warnings.txt
-          } | tee -a $OUT/summary.txt
-          cat $OUT/summary.txt >> $GITHUB_STEP_SUMMARY
+            echo "# Migration Log Report"
+            echo
+            echo "Organization: $ORG"
+            echo "Total repositories: $TOTAL_REPOS"
+            echo "Repositories with Migration Log: $REPOS_WITH_LOG"
+            echo "Repositories without Migration Log: $REPOS_WITHOUT_LOG"
+            echo "Repositories with warnings: $REPOS_WITH_WARNINGS"
+            echo "Repositories with errors: $REPOS_WITH_ERRORS"
+            echo "Comment retrieval failures: $COMMENT_FETCH_FAILURES"
 
-      - name: Upload
-        if: always()
+            echo
+            echo "## Top warnings"
+            echo
+
+            if [[ -s "$COMMON_WARNINGS" ]]; then
+              head -20 "$COMMON_WARNINGS"
+            else
+              echo "No warnings found."
+            fi
+
+            echo
+            echo "## Top errors"
+            echo
+
+            if [[ -s "$COMMON_ERRORS" ]]; then
+              head -20 "$COMMON_ERRORS"
+            else
+              echo "No errors found."
+            fi
+
+          } | tee "$SUMMARY"
+
+          cat "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+
+          # ------------------------------------------------------------
+          # We no longer need processing files.
+          # Final report remains for artifact upload.
+          # ------------------------------------------------------------
+
+          rm -rf "$TEMP_DIR"
+
+          echo
+          echo "Report generation completed."
+          echo "Report directory: $REPORT_DIR"
+
+      # --------------------------------------------------------------
+      # Upload final report
+      # --------------------------------------------------------------
+
+      - name: Upload migration log report
+        if: always() && hashFiles('migration-log-report/**') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: migration-log-report
-          path: report/
+          name: migration-log-report-${{ inputs.target_org }}-${{ github.run_id }}
+          path: migration-log-report/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
+
+      # --------------------------------------------------------------
+      # Final runner cleanup
+      #
+      # Runs even if previous steps fail.
+      # Only removes directories created by this workflow.
+      # --------------------------------------------------------------
+
+      - name: Clean runner files
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          TEMP_DIR="${RUNNER_TEMP}/migration-log-report-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          echo "Cleaning migration report files from runner..."
+
+          rm -rf "${REPORT_DIR:?}"
+          rm -rf "${TEMP_DIR:?}"
+
+          echo "Runner cleanup completed."
