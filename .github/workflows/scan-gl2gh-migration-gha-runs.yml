@@ -1,0 +1,582 @@
+name: GitLab Migration Pipeline Run Report
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Repository containing the GitLab migration workflow"
+        required: true
+        default: "gl2gh-migration-pipeline"
+
+      workflow_file:
+        description: "GitLab migration workflow file name"
+        required: true
+        default: "migration.yml"
+
+jobs:
+  report:
+    runs-on: [ubuntu-latest]
+
+    environment: gl2gh-migration-secrets
+
+    env:
+      GH_HOST: github.com
+      GH_TOKEN: ${{ secrets.GH_PAT }}
+
+      REPOSITORY: ${{ inputs.repository }}
+      WORKFLOW_FILE: ${{ inputs.workflow_file }}
+
+      REPORT_DIR: ${{ github.workspace }}/pipeline-run-report
+
+    steps:
+
+      # --------------------------------------------------------------
+      # 1. Validate
+      # --------------------------------------------------------------
+
+      - name: Validate configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::GH_PAT secret is missing."
+            exit 1
+          fi
+
+          if [[ -z "${REPOSITORY:-}" ]]; then
+            echo "::error::Repository is missing."
+            exit 1
+          fi
+
+          if [[ -z "${WORKFLOW_FILE:-}" ]]; then
+            echo "::error::Workflow file is missing."
+            exit 1
+          fi
+
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::error::GitHub CLI is not installed."
+            exit 1
+          fi
+
+          if ! command -v unzip >/dev/null 2>&1; then
+            echo "::error::unzip is not installed."
+            exit 1
+          fi
+
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::error::jq is not installed."
+            exit 1
+          fi
+
+          echo "Validating GitHub authentication..."
+
+          if ! gh auth status --hostname "$GH_HOST" >/dev/null 2>&1; then
+            echo "::error::GitHub authentication failed."
+            exit 1
+          fi
+
+          echo "Validating repository access..."
+
+          if ! gh api "repos/$GITHUB_REPOSITORY_OWNER/$REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Unable to access repository: $GITHUB_REPOSITORY_OWNER/$REPOSITORY"
+            exit 1
+          fi
+
+          echo "Validating workflow..."
+
+          if ! gh api \
+            "repos/$GITHUB_REPOSITORY_OWNER/$REPOSITORY/actions/workflows/$WORKFLOW_FILE" \
+            >/dev/null 2>&1; then
+
+            echo "::error::Unable to find workflow: $WORKFLOW_FILE"
+            exit 1
+          fi
+
+          echo "Validation completed successfully."
+
+      # --------------------------------------------------------------
+      # 2. Generate report
+      # --------------------------------------------------------------
+
+      - name: Generate pipeline run report
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TEMP_DIR="${RUNNER_TEMP}/pipeline-run-report-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          rm -rf "$REPORT_DIR" "$TEMP_DIR"
+
+          mkdir -p "$REPORT_DIR"
+          mkdir -p "$TEMP_DIR"
+
+          RUNS_JSON="$TEMP_DIR/runs.jsonl"
+
+          RUNS_CSV="$REPORT_DIR/runs.csv"
+          MIGRATION_RESULTS="$REPORT_DIR/migration-results.csv"
+          MIGRATION_FAILURES="$REPORT_DIR/migration-failures.csv"
+          VALIDATION_RESULTS="$REPORT_DIR/validation-results.csv"
+          VALIDATION_FAILURES="$REPORT_DIR/validation-failures.csv"
+          SUMMARY="$REPORT_DIR/summary.txt"
+
+          echo "run_id,run_number,created_at,conclusion,migration_status,validation_status" \
+            > "$RUNS_CSV"
+
+          echo "run_id,run_number,total,migrated,failed,skipped" \
+            > "$MIGRATION_RESULTS"
+
+          echo "run_id,run_number,repository" \
+            > "$MIGRATION_FAILURES"
+
+          echo "run_id,run_number,total,success,failed,skipped" \
+            > "$VALIDATION_RESULTS"
+
+          echo "run_id,run_number,failure" \
+            > "$VALIDATION_FAILURES"
+
+          # ----------------------------------------------------------
+          # Get completed workflow runs
+          # ----------------------------------------------------------
+
+          echo "Collecting workflow runs..."
+
+          gh api \
+            "repos/$GITHUB_REPOSITORY_OWNER/$REPOSITORY/actions/workflows/$WORKFLOW_FILE/runs?status=completed&per_page=100" \
+            --paginate \
+            --jq '.workflow_runs[] |
+              {
+                id: .id,
+                run_number: .run_number,
+                created_at: .created_at,
+                conclusion: .conclusion
+              }' > "$RUNS_JSON"
+
+          TOTAL_RUNS="$(wc -l < "$RUNS_JSON" | tr -d ' ')"
+
+          echo "Completed workflow runs found: $TOTAL_RUNS"
+
+          if (( TOTAL_RUNS == 0 )); then
+            echo "::warning::No completed workflow runs found."
+          fi
+
+          # ----------------------------------------------------------
+          # Process each run
+          # ----------------------------------------------------------
+
+          PROCESSED=0
+
+          while IFS= read -r run; do
+
+            [[ -z "$run" ]] && continue
+
+            PROCESSED=$((PROCESSED + 1))
+
+            RUN_ID="$(jq -r '.id' <<< "$run")"
+            RUN_NUMBER="$(jq -r '.run_number' <<< "$run")"
+            CREATED_AT="$(jq -r '.created_at' <<< "$run")"
+            CONCLUSION="$(jq -r '.conclusion // "unknown"' <<< "$run")"
+
+            RUN_TEMP="$TEMP_DIR/run-$RUN_ID"
+            RUN_ZIP="$RUN_TEMP/logs.zip"
+            RUN_LOG_DIR="$RUN_TEMP/logs"
+            COMBINED_LOG="$RUN_TEMP/combined.log"
+
+            mkdir -p "$RUN_LOG_DIR"
+
+            echo
+            echo "[$PROCESSED/$TOTAL_RUNS] Processing run #$RUN_NUMBER ($RUN_ID)"
+
+            # --------------------------------------------------------
+            # Download logs for this run only
+            # --------------------------------------------------------
+
+            if ! gh api \
+              "repos/$GITHUB_REPOSITORY_OWNER/$REPOSITORY/actions/runs/$RUN_ID/logs" \
+              > "$RUN_ZIP"; then
+
+              echo "::warning::Unable to download logs for run #$RUN_NUMBER"
+
+              echo "$RUN_ID,$RUN_NUMBER,$CREATED_AT,$CONCLUSION,log-unavailable,log-unavailable" \
+                >> "$RUNS_CSV"
+
+              rm -rf "$RUN_TEMP"
+
+              continue
+            fi
+
+            if ! unzip -qq "$RUN_ZIP" -d "$RUN_LOG_DIR"; then
+
+              echo "::warning::Unable to extract logs for run #$RUN_NUMBER"
+
+              echo "$RUN_ID,$RUN_NUMBER,$CREATED_AT,$CONCLUSION,log-unavailable,log-unavailable" \
+                >> "$RUNS_CSV"
+
+              rm -rf "$RUN_TEMP"
+
+              continue
+            fi
+
+            # ZIP is no longer required.
+            rm -f "$RUN_ZIP"
+
+            # --------------------------------------------------------
+            # Combine text logs locally
+            # --------------------------------------------------------
+
+            find "$RUN_LOG_DIR" \
+              -type f \
+              -exec cat {} + > "$COMBINED_LOG"
+
+            # --------------------------------------------------------
+            # MIGRATION SUMMARY
+            #
+            # Expected:
+            #
+            # [SUMMARY] Total: 75 | Migrated: 73 |
+            # Failed: 2 | Skipped: 0
+            # --------------------------------------------------------
+
+            MIGRATION_SUMMARY="$(
+              grep -E '\[SUMMARY\][[:space:]]+Total:[[:space:]]*[0-9]+[[:space:]]*\|[[:space:]]*Migrated:[[:space:]]*[0-9]+[[:space:]]*\|[[:space:]]*Failed:[[:space:]]*[0-9]+[[:space:]]*\|[[:space:]]*Skipped:[[:space:]]*[0-9]+' \
+                "$COMBINED_LOG" |
+                tail -1 || true
+            )"
+
+            MIGRATION_STATUS="unavailable"
+
+            if [[ -n "$MIGRATION_SUMMARY" ]]; then
+
+              MIG_TOTAL="$(
+                sed -nE \
+                  's/.*Total:[[:space:]]*([0-9]+).*/\1/p' \
+                  <<< "$MIGRATION_SUMMARY"
+              )"
+
+              MIG_MIGRATED="$(
+                sed -nE \
+                  's/.*Migrated:[[:space:]]*([0-9]+).*/\1/p' \
+                  <<< "$MIGRATION_SUMMARY"
+              )"
+
+              MIG_FAILED="$(
+                sed -nE \
+                  's/.*Failed:[[:space:]]*([0-9]+).*/\1/p' \
+                  <<< "$MIGRATION_SUMMARY"
+              )"
+
+              MIG_SKIPPED="$(
+                sed -nE \
+                  's/.*Skipped:[[:space:]]*([0-9]+).*/\1/p' \
+                  <<< "$MIGRATION_SUMMARY"
+              )"
+
+              if (( MIG_FAILED > 0 )); then
+                MIGRATION_STATUS="partial-failure"
+              else
+                MIGRATION_STATUS="success"
+              fi
+
+              echo "$RUN_ID,$RUN_NUMBER,$MIG_TOTAL,$MIG_MIGRATED,$MIG_FAILED,$MIG_SKIPPED" \
+                >> "$MIGRATION_RESULTS"
+
+              echo "Migration: Total=$MIG_TOTAL Migrated=$MIG_MIGRATED Failed=$MIG_FAILED Skipped=$MIG_SKIPPED"
+
+              # ------------------------------------------------------
+              # Only look for failed repositories if Failed > 0
+              #
+              # Expected:
+              #
+              # [WARNING] Failed: archive/repo-name (...)
+              # ------------------------------------------------------
+
+              if (( MIG_FAILED > 0 )); then
+
+                grep -E '\[WARNING\][[:space:]]+Failed:' \
+                  "$COMBINED_LOG" |
+                  sed -E \
+                    's/.*\[WARNING\][[:space:]]+Failed:[[:space:]]*//' |
+                  while IFS= read -r failure; do
+
+                    [[ -z "$failure" ]] && continue
+
+                    # Keep complete failure text so source + target
+                    # path information is not lost.
+                    escaped_failure="$(
+                      printf '%s' "$failure" |
+                      sed 's/"/""/g'
+                    )"
+
+                    printf '%s,%s,"%s"\n' \
+                      "$RUN_ID" \
+                      "$RUN_NUMBER" \
+                      "$escaped_failure" \
+                      >> "$MIGRATION_FAILURES"
+
+                  done || true
+
+              fi
+
+            else
+
+              echo "Migration summary not found."
+
+            fi
+
+            # --------------------------------------------------------
+            # POST-VALIDATION SUMMARY
+            #
+            # Expected somewhere near end of validation:
+            #
+            # Total : 75
+            # Skipped : 2
+            # Success : 73
+            # Failed : 0
+            #
+            # We first locate a "Total :" line and inspect the next
+            # few lines for the associated validation summary.
+            # --------------------------------------------------------
+
+            VALIDATION_STATUS="unavailable"
+
+            VALIDATION_BLOCK="$(
+              grep -E \
+                -A 8 \
+                'Total[[:space:]]*:[[:space:]]*[0-9]+' \
+                "$COMBINED_LOG" |
+              grep -E \
+                'Total[[:space:]]*:|Skipped[[:space:]]*:|Success[[:space:]]*:|Failed[[:space:]]*:' |
+              tail -4 || true
+            )"
+
+            VAL_TOTAL="$(
+              grep -E 'Total[[:space:]]*:' \
+                <<< "$VALIDATION_BLOCK" |
+                tail -1 |
+                sed -nE \
+                  's/.*Total[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p'
+            )"
+
+            VAL_SKIPPED="$(
+              grep -E 'Skipped[[:space:]]*:' \
+                <<< "$VALIDATION_BLOCK" |
+                tail -1 |
+                sed -nE \
+                  's/.*Skipped[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p'
+            )"
+
+            VAL_SUCCESS="$(
+              grep -E 'Success[[:space:]]*:' \
+                <<< "$VALIDATION_BLOCK" |
+                tail -1 |
+                sed -nE \
+                  's/.*Success[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p'
+            )"
+
+            VAL_FAILED="$(
+              grep -E 'Failed[[:space:]]*:' \
+                <<< "$VALIDATION_BLOCK" |
+                tail -1 |
+                sed -nE \
+                  's/.*Failed[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p'
+            )"
+
+            if [[ -n "$VAL_TOTAL" &&
+                  -n "$VAL_SKIPPED" &&
+                  -n "$VAL_SUCCESS" &&
+                  -n "$VAL_FAILED" ]]; then
+
+              if (( VAL_FAILED > 0 )); then
+                VALIDATION_STATUS="failure"
+              else
+                VALIDATION_STATUS="success"
+              fi
+
+              echo "$RUN_ID,$RUN_NUMBER,$VAL_TOTAL,$VAL_SUCCESS,$VAL_FAILED,$VAL_SKIPPED" \
+                >> "$VALIDATION_RESULTS"
+
+              echo "Validation: Total=$VAL_TOTAL Success=$VAL_SUCCESS Failed=$VAL_FAILED Skipped=$VAL_SKIPPED"
+
+              # ------------------------------------------------------
+              # Capture validation failure lines when present.
+              #
+              # This intentionally records the complete matching
+              # failure line because exact validation failure wording
+              # may differ between versions.
+              # ------------------------------------------------------
+
+              if (( VAL_FAILED > 0 )); then
+
+                grep -iE \
+                  '\[(ERROR|WARNING)\].*(validation.*fail|failed.*validation)|validation.*failed' \
+                  "$COMBINED_LOG" |
+                  while IFS= read -r failure; do
+
+                    [[ -z "$failure" ]] && continue
+
+                    escaped_failure="$(
+                      printf '%s' "$failure" |
+                      sed 's/"/""/g'
+                    )"
+
+                    printf '%s,%s,"%s"\n' \
+                      "$RUN_ID" \
+                      "$RUN_NUMBER" \
+                      "$escaped_failure" \
+                      >> "$VALIDATION_FAILURES"
+
+                  done || true
+
+              fi
+
+            else
+
+              echo "Validation summary not found."
+
+            fi
+
+            # --------------------------------------------------------
+            # Record overall run
+            # --------------------------------------------------------
+
+            echo "$RUN_ID,$RUN_NUMBER,$CREATED_AT,$CONCLUSION,$MIGRATION_STATUS,$VALIDATION_STATUS" \
+              >> "$RUNS_CSV"
+
+            # --------------------------------------------------------
+            # Critical disk cleanup:
+            #
+            # This removes the CURRENT run's extracted logs before
+            # proceeding to the next workflow run.
+            # --------------------------------------------------------
+
+            rm -rf "$RUN_TEMP"
+
+          done < "$RUNS_JSON"
+
+          # ----------------------------------------------------------
+          # Generate overall summary
+          # ----------------------------------------------------------
+
+          MIGRATION_RUNS="$(
+            awk -F, 'NR > 1 {c++} END {print c+0}' \
+              "$MIGRATION_RESULTS"
+          )"
+
+          MIGRATION_SUCCESS_RUNS="$(
+            awk -F, 'NR > 1 && $5 == 0 {c++} END {print c+0}' \
+              "$MIGRATION_RESULTS"
+          )"
+
+          MIGRATION_FAILURE_RUNS="$(
+            awk -F, 'NR > 1 && $5 > 0 {c++} END {print c+0}' \
+              "$MIGRATION_RESULTS"
+          )"
+
+          TOTAL_MIGRATION_FAILURES="$(
+            awk -F, 'NR > 1 {sum += $5} END {print sum+0}' \
+              "$MIGRATION_RESULTS"
+          )"
+
+          VALIDATION_RUNS="$(
+            awk -F, 'NR > 1 {c++} END {print c+0}' \
+              "$VALIDATION_RESULTS"
+          )"
+
+          VALIDATION_SUCCESS_RUNS="$(
+            awk -F, 'NR > 1 && $5 == 0 {c++} END {print c+0}' \
+              "$VALIDATION_RESULTS"
+          )"
+
+          VALIDATION_FAILURE_RUNS="$(
+            awk -F, 'NR > 1 && $5 > 0 {c++} END {print c+0}' \
+              "$VALIDATION_RESULTS"
+          )"
+
+          TOTAL_VALIDATION_FAILURES="$(
+            awk -F, 'NR > 1 {sum += $5} END {print sum+0}' \
+              "$VALIDATION_RESULTS"
+          )"
+
+          WORKFLOW_SUCCESS="$(
+            awk -F, 'NR > 1 && $4 == "success" {c++} END {print c+0}' \
+              "$RUNS_CSV"
+          )"
+
+          WORKFLOW_FAILURE="$(
+            awk -F, 'NR > 1 && $4 == "failure" {c++} END {print c+0}' \
+              "$RUNS_CSV"
+          )"
+
+          {
+            echo "# GitLab Migration Pipeline Report"
+            echo
+            echo "Repository: $GITHUB_REPOSITORY_OWNER/$REPOSITORY"
+            echo "Workflow: $WORKFLOW_FILE"
+            echo
+            echo "Workflow runs scanned: $TOTAL_RUNS"
+
+            echo
+            echo "## Migration"
+            echo
+            echo "Runs with migration summary: $MIGRATION_RUNS"
+            echo "Runs with successful migration: $MIGRATION_SUCCESS_RUNS"
+            echo "Runs with migration failures: $MIGRATION_FAILURE_RUNS"
+            echo "Total repository migration failures: $TOTAL_MIGRATION_FAILURES"
+
+            echo
+            echo "## Post Validation"
+            echo
+            echo "Runs with validation summary: $VALIDATION_RUNS"
+            echo "Runs with successful validation: $VALIDATION_SUCCESS_RUNS"
+            echo "Runs with validation failures: $VALIDATION_FAILURE_RUNS"
+            echo "Total validation failures: $TOTAL_VALIDATION_FAILURES"
+
+            echo
+            echo "## Workflow"
+            echo
+            echo "Successful workflow runs: $WORKFLOW_SUCCESS"
+            echo "Failed workflow runs: $WORKFLOW_FAILURE"
+
+          } | tee "$SUMMARY"
+
+          cat "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+
+          # All temporary logs should already be deleted.
+          # Remove remaining metadata/temp files.
+          rm -rf "$TEMP_DIR"
+
+          echo
+          echo "Report generation completed."
+
+      # --------------------------------------------------------------
+      # 3. Upload final report
+      # --------------------------------------------------------------
+
+      - name: Upload pipeline run report
+        if: always() && hashFiles('pipeline-run-report/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-run-report-${{ github.run_id }}
+          path: pipeline-run-report/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
+
+      # --------------------------------------------------------------
+      # 4. Final cleanup
+      # --------------------------------------------------------------
+
+      - name: Clean runner files
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          TEMP_DIR="${RUNNER_TEMP}/pipeline-run-report-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          echo "Cleaning pipeline report files from runner..."
+
+          rm -rf "${REPORT_DIR:?}"
+          rm -rf "${TEMP_DIR:?}"
+
+          echo "Runner cleanup completed."
